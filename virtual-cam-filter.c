@@ -7,6 +7,7 @@ struct virtual_cam_filter_context {
 	uint32_t video_linesize;
 	video_t *video_output;
 	bool output_active;
+	bool output_stopping;
 	uint32_t width;
 	uint32_t height;
 	gs_texrender_t *texrender;
@@ -25,6 +26,18 @@ struct video_frame {
 	uint32_t linesize[MAX_AV_PLANES];
 };
 
+/* Call with the graphics context entered. Unmap before replacing the surface. */
+static void virtual_cam_filter_reset_surface(
+	struct virtual_cam_filter_context *context)
+{
+	if (context->video_data)
+		gs_stagesurface_unmap(context->stagesurface);
+	context->video_data = NULL;
+	context->video_linesize = 0;
+	gs_stagesurface_destroy(context->stagesurface);
+	context->stagesurface = NULL;
+}
+
 void virtual_cam_filter_offscreen_render(void *data, uint32_t cx, uint32_t cy)
 {
 	struct virtual_cam_filter_context *filter = data;
@@ -35,6 +48,12 @@ void virtual_cam_filter_offscreen_render(void *data, uint32_t cx, uint32_t cy)
 
 	const uint32_t width = obs_source_get_base_width(target);
 	const uint32_t height = obs_source_get_base_height(target);
+
+	/* Tick owns stream changes. Never render a new size into the old stream. */
+	if (!obs_source_enabled(filter->source) || !filter->output_active ||
+	    filter->output_stopping || !filter->video_output || !width || !height ||
+	    filter->width != width || filter->height != height)
+		return;
 
 	gs_texrender_reset(filter->texrender);
 
@@ -54,29 +73,6 @@ void virtual_cam_filter_offscreen_render(void *data, uint32_t cx, uint32_t cy)
 
 		gs_blend_state_pop();
 		gs_texrender_end(filter->texrender);
-
-		if (filter->width != width || filter->height != height) {
-
-			gs_stagesurface_destroy(filter->stagesurface);
-			filter->stagesurface =
-				gs_stagesurface_create(width, height, GS_BGRA);
-
-			struct video_output_info vi = {0};
-			vi.format = VIDEO_FORMAT_BGRA;
-			vi.width = width;
-			vi.height = height;
-			vi.fps_den = filter->ovi.fps_den;
-			vi.fps_num = filter->ovi.fps_num;
-			vi.cache_size = 16;
-			vi.colorspace = VIDEO_CS_DEFAULT;
-			vi.range = VIDEO_RANGE_DEFAULT;
-			vi.name = obs_source_get_name(filter->source);
-
-			video_output_close(filter->video_output);
-			video_output_open(&filter->video_output, &vi);
-			filter->width = width;
-			filter->height = height;
-		}
 
 		struct video_frame output_frame;
 		if (filter->video_output &&
@@ -145,17 +141,19 @@ static void *virtual_cam_filter_source_create(obs_data_t *settings,
 static void virtual_cam_filter_source_destroy(void *data)
 {
 	struct virtual_cam_filter_context *context = data;
-	obs_output_stop(context->virtualCam);
-
 	obs_remove_main_render_callback(virtual_cam_filter_offscreen_render,
 					context);
 
+	/* Release waits for asynchronous raw-video capture teardown before the
+	 * stream it references can be freed. */
+	obs_output_release(context->virtualCam);
 	video_output_close(context->video_output);
 	context->video_output = NULL;
 
-	gs_stagesurface_unmap(context->stagesurface);
-	gs_stagesurface_destroy(context->stagesurface);
+	obs_enter_graphics();
+	virtual_cam_filter_reset_surface(context);
 	gs_texrender_destroy(context->texrender);
+	obs_leave_graphics();
 	bfree(context);
 }
 
@@ -163,11 +161,39 @@ static void virtual_cam_filter_source_tick(void *data, float seconds)
 {
 	struct virtual_cam_filter_context *context = data;
 	obs_source_t *target = obs_filter_get_target(context->source);
-	if (!target)
+	const uint32_t width = target ? obs_source_get_base_width(target) : 0;
+	const uint32_t height = target ? obs_source_get_base_height(target) : 0;
+	const bool enabled = obs_source_enabled(context->source) && width && height;
+	const bool resized = context->width != width || context->height != height;
+
+	if (context->output_active && (!enabled || resized)) {
+		obs_output_stop(context->virtualCam);
+		context->output_active = false;
+		context->output_stopping = true;
+	}
+
+	/* obs_output_stop returns before raw capture has disconnected. Retain
+	 * its media until a later tick observes that capture has ended. */
+	if (context->output_stopping) {
+		if (obs_output_active(context->virtualCam))
+			return;
+		context->output_stopping = false;
+	}
+
+	if (context->video_output && (!enabled || resized)) {
+		obs_output_set_media(context->virtualCam, NULL, NULL);
+		video_output_close(context->video_output);
+		context->video_output = NULL;
+		context->width = context->height = 0;
+		obs_enter_graphics();
+		virtual_cam_filter_reset_surface(context);
+		obs_leave_graphics();
+	}
+
+	if (!enabled || !context->virtualCam)
 		return;
-	const uint32_t width = obs_source_get_base_width(target);
-	const uint32_t height = obs_source_get_base_height(target);
-	if (obs_source_enabled(context->source) && !context->video_output) {
+
+	if (!context->video_output) {
 		struct video_output_info vi = {0};
 		vi.format = VIDEO_FORMAT_BGRA;
 		vi.width = width;
@@ -178,7 +204,11 @@ static void virtual_cam_filter_source_tick(void *data, float seconds)
 		vi.colorspace = VIDEO_CS_DEFAULT;
 		vi.range = VIDEO_RANGE_DEFAULT;
 		vi.name = obs_source_get_name(context->source);
-		video_output_open(&context->video_output, &vi);
+		if (video_output_open(&context->video_output, &vi) !=
+		    VIDEO_OUTPUT_SUCCESS)
+			return;
+		context->width = width;
+		context->height = height;
 	}
 	if (!context->output_active && context->video_output &&
 	    obs_source_enabled(context->source)) {
@@ -187,11 +217,6 @@ static void virtual_cam_filter_source_tick(void *data, float seconds)
 		if (obs_output_start(context->virtualCam)) {
 			context->output_active = true;
 		}
-
-	} else if (context->output_active &&
-		   !obs_source_enabled(context->source)) {
-		obs_output_stop(context->virtualCam);
-		context->output_active = false;
 	}
 }
 
@@ -253,3 +278,4 @@ bool obs_module_load(void)
 	obs_register_source(&virtual_cam_filter_info);
 	return true;
 }
+
